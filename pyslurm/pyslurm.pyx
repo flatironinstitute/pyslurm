@@ -341,6 +341,14 @@ def slurm_api_version():
             SLURM_VERSION_MINOR(version),
             SLURM_VERSION_MICRO(version))
 
+def slurm_init(conf_file=None):
+    if conf_file:
+        slurm.slurm_init(conf_file.encode('utf8'))
+    else:
+        slurm.slurm_init(NULL)
+	
+def slurm_fini():
+    slurm.slurm_fini()
 
 def slurm_load_slurmd_status():
     """Issue RPC to get and load the status of Slurmd daemon.
@@ -351,7 +359,9 @@ def slurm_load_slurmd_status():
     cdef:
         dict Status = {}, Status_dict = {}
         slurm.slurmd_status_t *slurmd_status = NULL
-        int errCode = slurm.slurm_load_slurmd_status(&slurmd_status)
+        int errCode
+	
+    errCode = slurm.slurm_load_slurmd_status(&slurmd_status)
 
     if errCode == slurm.SLURM_SUCCESS:
         hostname = slurm.stringOrNone(slurmd_status.hostname, '')
@@ -377,31 +387,6 @@ def slurm_load_slurmd_status():
 
     return Status
 
-def slurm_init(conf_file=None):
-    """
-    This function MUST be called before any internal API calls to ensure
-    Slurm's internal configuration structures have been populated.
-
-    :param string conf_file: Absolute path to the configuration file
-    (optional). If None (default value), libslurm automatically locates its
-    own configuration.
-
-    :returns: None
-    :rtype: None
-    """
-    if conf_file:
-        slurm.slurm_init(conf_file.encode('UTF-8'))
-    else:
-        slurm.slurm_init(NULL)
-
-def slurm_fini():
-    """Call at process termination to cleanup internal configuration
-    structures.
-
-    :returns: None
-    :rtype: None
-    """
-    slurm.slurm_fini()
 
 #
 # Slurm Config Class
@@ -2046,15 +2031,16 @@ cdef class job:
             Job_dict['num_tasks'] = self._record.num_tasks
             Job_dict['partition'] = slurm.stringOrNone(self._record.partition, '')
 
+            #Yanbin
             if self._record.pn_min_memory & slurm.MEM_PER_CPU:
                 self._record.pn_min_memory &= (~slurm.MEM_PER_CPU)
-                Job_dict['mem_per_cp'] = True
-                Job_dict['min_memory_cp'] = self._record.pn_min_memory
+                Job_dict['mem_per_cpu'] = True
+                Job_dict['min_memory_cpu'] = self._record.pn_min_memory
                 Job_dict['mem_per_node'] = False
                 Job_dict['min_memory_node'] = None
             else:
-                Job_dict['mem_per_cp'] = False
-                Job_dict['min_memory_cp'] = None
+                Job_dict['mem_per_cpu'] = False
+                Job_dict['min_memory_cpu'] = None
                 Job_dict['mem_per_node'] = True
                 Job_dict['min_memory_node'] = self._record.pn_min_memory
 
@@ -2120,10 +2106,10 @@ cdef class job:
             Job_dict['sockets_per_node'] = slurm.int16orNone(self._record.sockets_per_node)
             Job_dict['start_time'] = self._record.start_time
 
+            #Yanbin
             if self._record.state_desc:
-                Job_dict['state_reason'] = self._record.state_desc.decode("UTF-8").replace(" ", "_")
-            else:
-                Job_dict['state_reason'] = slurm.stringOrNone(
+                Job_dict['state_reason_desc'] = self._record.state_desc.decode("UTF-8").replace(" ", "_")
+            Job_dict['state_reason'] = slurm.stringOrNone(
                     slurm.slurm_job_reason_string(
                         <slurm.job_state_reason>self._record.state_reason
                     ), ''
@@ -2173,6 +2159,12 @@ cdef class job:
             Job_dict['wckey'] = slurm.stringOrNone(self._record.wckey, '')
             Job_dict['work_dir'] = slurm.stringOrNone(self._record.work_dir, '')
 
+            gres_detail = []
+            for x in range(min(self._record.num_nodes, self._record.gres_detail_cnt)):
+                gres_detail.append(slurm.stringOrNone(self._record.gres_detail_str[x],''))
+                                   
+            Job_dict[u'gres_detail'] = gres_detail
+
             Job_dict['cpus_allocated'] = {}
             Job_dict['cpus_alloc_layout'] = {}
 
@@ -2187,6 +2179,12 @@ cdef class job:
                         Job_dict['cpus_allocated'][b_node_name] = self.__cpus_allocated_on_node(node_name)
                         Job_dict['cpus_alloc_layout'][b_node_name] = self.__cpus_allocated_list_on_node(node_name)
                 hl.destroy()
+    
+            #add pack_job by Yanbin
+            if self._record.het_job_id:
+                Job_dict[u'pack_job_id'] = self._record.het_job_id
+                Job_dict[u'pack_job_offset'] = self._record.het_job_offset
+                Job_dict[u'pack_job_id_set'] = slurm.stringOrNone(self._record.het_job_id_set, '')
 
             self._JobDict[self._record.job_id] = Job_dict
 
@@ -4987,7 +4985,8 @@ cdef class qos:
         cdef:
             slurm.slurmdb_qos_cond_t *new_qos_cond = NULL
             int apiError = 0
-            void* dbconn = slurm.slurmdb_connection_get(NULL)
+            uint16_t* persist_conn_flags = NULL 
+            void* dbconn = slurm.slurmdb_connection_get(persist_conn_flags)
             slurm.List QOSList = slurm.slurmdb_qos_get(dbconn, new_qos_cond)
 
         if QOSList is NULL:
@@ -5058,17 +5057,19 @@ cdef class qos:
                     QOS_info['grp_tres_run_mins'] = slurm.stringOrNone(qos.grp_tres_run_mins, '')
                     # QOS_info['grp_tres_run_mins_ctld']
                     QOS_info['grp_wall'] = qos.grp_wall
-                    QOS_info['max_jobs_p'] = qos.max_jobs_pu
-                    QOS_info['max_submit_jobs_p'] = qos.max_submit_jobs_pu
+                    #Yanbin
+                    QOS_info['max_jobs_pu'] = qos.max_jobs_pu
+                    QOS_info['max_submit_jobs_pu'] = qos.max_submit_jobs_pu
                     QOS_info['max_tres_mins_pj'] = slurm.stringOrNone(qos.max_tres_mins_pj, '')
                     # QOS_info['max_tres_min_pj_ctld']
                     QOS_info['max_tres_pj'] = slurm.stringOrNone(qos.max_tres_pj, '')
                     # QOS_info['max_tres_min_pj_ctld']
                     QOS_info['max_tres_pn'] = slurm.stringOrNone(qos.max_tres_pn, '')
                     # QOS_info['max_tres_min_pn_ctld']
-                    QOS_info['max_tres_p'] = slurm.stringOrNone(qos.max_tres_pu, '')
+                    #Yanbin
+                    QOS_info['max_tres_pu'] = slurm.stringOrNone(qos.max_tres_pu, '')
                     # QOS_info['max_tres_min_pu_ctld']
-                    QOS_info['max_tres_run_mins_p'] = slurm.stringOrNone(
+                    QOS_info['max_tres_run_mins_pu'] = slurm.stringOrNone(
                         qos.max_tres_run_mins_pu, '')
 
                     QOS_info['max_wall_pj'] = qos.max_wall_pj
@@ -5104,10 +5105,11 @@ cdef class slurmdb_jobs:
     cdef:
         void* db_conn
         slurm.slurmdb_job_cond_t *job_cond
+        uint16_t persist_conn_flags
 
     def __cinit__(self):
         self.job_cond = <slurm.slurmdb_job_cond_t *>xmalloc(sizeof(slurm.slurmdb_job_cond_t))
-        self.db_conn = slurm.slurmdb_connection_get(NULL)
+        self.db_conn = slurm.slurmdb_connection_get(&self.persist_conn_flags)
 
     def __dealloc__(self):
         slurm.xfree(self.job_cond)
@@ -5480,15 +5482,15 @@ cdef class slurmdb_clusters:
     cdef:
         void *db_conn
         slurm.slurmdb_cluster_cond_t *cluster_cond
+        uint16_t persist_conn_flags
 
     def __cinit__(self):
         self.cluster_cond = <slurm.slurmdb_cluster_cond_t *>xmalloc(sizeof(slurm.slurmdb_cluster_cond_t))
         slurm.slurmdb_init_cluster_cond(self.cluster_cond, 0)
-        self.db_conn = slurm.slurmdb_connection_get(NULL)
+        self.db_conn = slurm.slurmdb_connection_get(&self.persist_conn_flags)
 
     def __dealloc__(self):
         slurm.slurmdb_destroy_cluster_cond(self.cluster_cond)
-        slurm.slurmdb_connection_close(&self.db_conn)
 
     def set_cluster_condition(self, start_time, end_time):
         """Limit the next get() call to clusters that existed after and before
@@ -6491,6 +6493,3 @@ cdef class licenses:
         else:
             apiError = slurm.slurm_get_errno()
             raise ValueError(slurm.stringOrNone(slurm.slurm_strerror(apiError), ''), apiError)
-
-# Automatically load Slurm configuration data structure at pyslurm module load
-slurm_init()
